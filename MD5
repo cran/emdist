@@ -1,0 +1,7 @@
+855bc3339f684b4cd6892470a68a12e7 *DESCRIPTION
+383d7347a92c4534945e01504f91e492 *NAMESPACE
+0e07071de28a1d450aade2c63d03a330 *R/emd.R
+4bb42f09214debd377fe5057c94de22a *man/emd.Rd
+47e63034057dfc9c09d622ce9aa48e76 *src/emd-r.c
+6eab1ae17779b0c608dcb31e805d11db *src/emd-rubner.c
+6f7b5990be5db6d2fec4f118613b6740 *src/emd-rubner.h
