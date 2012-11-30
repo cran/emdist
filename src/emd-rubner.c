@@ -3,6 +3,11 @@
 
     Last update: 3/14/98
     Modified by Simon Urbanek: 2011/02/28
+    - added extrapolation support
+    - add pluggable cost computing functions
+    Modified by Simon Urbanek: 2011/02/28
+    - changed code to use dynamically allocated structures
+      in order to remove the limit on signature sizes    
 
     An implementation of the Earth Movers Distance.
     Based of the solution for the Transportation problem as described in
@@ -35,6 +40,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 
 #define EMD_RUBNER_MAIN 1
@@ -76,21 +82,59 @@ typedef struct node2_t {
   struct node2_t *NextR;               /* NEXT ROW */
 } node2_t;
 
+static void *mem_alloc(long size) {
+    void *m = malloc(size);
+    if (!m) Rf_error("Unable to memory (%.1f MB) in emdist", ((double)size) / (1024.0 * 1024.0));
+    return m;
+}
 
+static void mem_free(void *m) {
+    free(m);
+}
+
+#define SMALL_SIG 512  /* signatures smaller than this are handled in
+			  static memory, for larger ones we'll need
+			  to perform memory allocation (slower). It
+			  doesn't really make sense to make this too
+			  big, since longer signatures also take
+			  longer to compute so memory allocation is
+			  the lesser problem. */
+
+static node1_t local_U[SMALL_SIG], local_V[SMALL_SIG];
+
+#define MAT(A, M, N) A[(M) + ((N) * max_sig)]
 
 /* GLOBAL VARIABLE DECLARATION */
+static int max_sig; /* size of all structures */
 static int _n1, _n2;                          /* SIGNATURES SIZES */
-static float _C[MAX_SIG_SIZE1][MAX_SIG_SIZE1];/* THE COST MATRIX */
-static node2_t _X[MAX_SIG_SIZE1*2];            /* THE BASIC VARIABLES VECTOR */
+static float *_C;                             /* THE COST MATRIX */
+static float local_C[SMALL_SIG * SMALL_SIG];
+
+static node2_t *_X;                           /* THE BASIC VARIABLES VECTOR */
+static node2_t local_X[SMALL_SIG * 2];
+
 /* VARIABLES TO HANDLE _X EFFICIENTLY */
 static node2_t *_EndX, *_EnterX;
-static char _IsX[MAX_SIG_SIZE1][MAX_SIG_SIZE1];
-static node2_t *_RowsX[MAX_SIG_SIZE1], *_ColsX[MAX_SIG_SIZE1];
+static char *_IsX;
+static char local_IsX[SMALL_SIG * SMALL_SIG];
+static node2_t **_RowsX, **_ColsX;
+static node2_t *local_RowsX[SMALL_SIG], *local_ColsX[SMALL_SIG];
+static node2_t **Loop;
+static node2_t *local_Loop[SMALL_SIG * 2];
+
+static char *IsUsed;
+static char local_IsUsed[SMALL_SIG * 2];
+static node1_t local_Ur[SMALL_SIG], local_Vr[SMALL_SIG];
+static double local_Delta[SMALL_SIG * SMALL_SIG];
+static double *Delta = local_Delta;
+static node1_t *Ur = local_Ur, *Vr = local_Vr;
+
+
 static double _maxW;
 static float _maxC;
 
 /* DECLARATION OF FUNCTIONS */
-static float init(signature_t *Signature1, signature_t *Signature2, int extrapolate);
+static float init(signature_t *Signature1, signature_t *Signature2, int extrapolate, dist_fn_t *dfn);
 static void findBasicVariables(node1_t *U, node1_t *V);
 static int isOptimal(node1_t *U, node1_t *V);
 static int findLoop(node2_t **Loop);
@@ -104,9 +148,20 @@ static void printSolution();
 #endif
 
 
+static void free_globals() {
+  if (_C != local_C) mem_free(_C);
+  if (_X != local_X) mem_free(_X);
+  if (_IsX != local_IsX) mem_free(_IsX);
+  if (_RowsX != local_RowsX) mem_free(_RowsX);
+  if (Loop != local_Loop) mem_free(Loop);
+  if (IsUsed != local_IsUsed) mem_free(IsUsed);
+  if (Delta != local_Delta) mem_free(Delta);
+  if (Ur != local_Ur) mem_free(Ur);
+}
+
 /******************************************************************************
 float emd(signature_t *Signature1, signature_t *Signature2,
-	  flow_t *Flow, int *FlowSize, int extrapolate)
+	  flow_t *Flow, int *FlowSize, int extrapolate, dist_fn_t *dfn)
   
 where
 
@@ -130,16 +185,21 @@ where
 ******************************************************************************/
 
 float emd_rubner(signature_t *Signature1, signature_t *Signature2,
-		 flow_t *Flow, int *FlowSize, int extrapolate)
+		 flow_t *Flow, int *FlowSize, int extrapolate, dist_fn_t *dfn)
 {
   int itr;
   double totalCost;
   float w;
   node2_t *XP;
   flow_t *FlowP;
-  node1_t U[MAX_SIG_SIZE1], V[MAX_SIG_SIZE1];
+  node1_t *U = local_U, *V = local_V;
+  max_sig = ((Signature1->n > Signature2->n) ? Signature1->n : Signature2->n) + 1;
+  if (max_sig > SMALL_SIG) {
+      U = (node1_t*) mem_alloc(sizeof(node1_t) * (max_sig * 2));
+      V = U + max_sig;
+  }
 
-  w = init(Signature1, Signature2, extrapolate);
+  w = init(Signature1, Signature2, extrapolate, dfn);
 
 #if DEBUG_LEVEL > 1
   Rprintf("\nINITIAL SOLUTION:\n");
@@ -185,7 +245,7 @@ float emd_rubner(signature_t *Signature1, signature_t *Signature2,
       if (XP->val == 0)  /* ZERO FLOW */
 	continue;
 
-      totalCost += (double)XP->val * _C[XP->i][XP->j];
+      totalCost += (double)XP->val * MAT(_C, XP->i, XP->j);
       if (Flow != NULL)
 	{
 	  FlowP->from = XP->i;
@@ -201,39 +261,143 @@ float emd_rubner(signature_t *Signature1, signature_t *Signature2,
   Rprintf("\n*** OPTIMAL SOLUTION (%d ITERATIONS): %f ***\n", itr, totalCost);
 #endif
 
+  if (U != local_U) mem_free(U);
+  free_globals();
+
   /* RETURN THE NORMALIZED COST == EMD */
   return (float)(totalCost / w);
 }
 
+/* BEGIN NEW.SU */
+static float dist_L2(feature_t *a, feature_t *b) {
+    float d = 0.0;
+    int i = 0;
+    while (i < FDIM) {
+	float s = a->loc[i] - b->loc[i];
+	d += s * s;
+	i++;
+    }
+    return sqrtf(d);
+}
 
+static float dist_L1(feature_t *a, feature_t *b) {
+    float d = 0.0;
+    int i = 0;
+    while (i < FDIM) {
+	float s = a->loc[i] - b->loc[i];
+	if (s > 0) 
+	    d += s;
+	else
+	    d -= s;
+	i++;
+    }
+    return d;
+}
+
+float calc_dist_L2(signature_t *Signature1, signature_t *Signature2) {
+    feature_t *P1, *P2;
+    float x = 0;
+    int i, j;
+    int n1 = Signature1->n, n2 = Signature2->n;
+    for(i = 0, P1 = Signature1->Features; i < n1; i++, P1++)
+	for(j = 0, P2 = Signature2->Features; j < n2; j++, P2++) 
+	    {
+		MAT(_C, i, j) = dist_L2(P1, P2);
+		if (MAT(_C, i, j) > x)
+		    x = MAT(_C, i, j);
+	    }
+    return x;
+}
+
+float calc_dist_L1(signature_t *Signature1, signature_t *Signature2) {
+    feature_t *P1, *P2;
+    float x = 0;
+    int i, j;
+    int n1 = Signature1->n, n2 = Signature2->n;
+    for(i = 0, P1 = Signature1->Features; i < n1; i++, P1++)
+	for(j = 0, P2 = Signature2->Features; j < n2; j++, P2++) 
+	    {
+		MAT(_C, i, j) = dist_L1(P1, P2);
+		if (MAT(_C, i, j) > x)
+		    x = MAT(_C, i, j);
+	    }
+    return x;
+}
+
+/* this is much slower since it involves function calls, but then it's more flexible ... */
+static dist_t *default_dist;
+
+void set_default_dist(dist_t *fn) {
+    default_dist = fn;
+}
+
+float calc_dist_default(signature_t *Signature1, signature_t *Signature2) {
+    feature_t *P1, *P2;
+    float x = 0;
+    int i, j;
+    int n1 = Signature1->n, n2 = Signature2->n;
+    for(i = 0, P1 = Signature1->Features; i < n1; i++, P1++)
+	for(j = 0, P2 = Signature2->Features; j < n2; j++, P2++) 
+	    {
+		MAT(_C, i, j) = default_dist(P1, P2);
+		if (MAT(_C, i, j) > x)
+		    x = MAT(_C, i, j);
+	    }
+    return x;
+}
+
+
+/* END NEW.SU */
 
 
 
 /**********************
    init
 **********************/
-static float init(signature_t *Signature1, signature_t *Signature2, int extrapolate)
+
+static double local_S[SMALL_SIG], local_D[SMALL_SIG];
+
+static float init(signature_t *Signature1, signature_t *Signature2, int extrapolate, dist_fn_t *dfn)
 {
-  int i, j;
+    int i, j;
   double sSum, dSum, diff;
-  feature_t *P1, *P2;
-  double S[MAX_SIG_SIZE1], D[MAX_SIG_SIZE1];
+  double *S, *D;
  
   _n1 = Signature1->n;
   _n2 = Signature2->n;
 
-  if (_n1 > MAX_SIG_SIZE || _n2 > MAX_SIG_SIZE)
-      Rf_error("emd: Signature size is limited to %d\n", MAX_SIG_SIZE);
+  max_sig = ((_n1 > _n2) ? _n1 : _n2) + 1;
+  /* if the signatures are too big, use allocated memory, otherwise use local static memory */
+  if (max_sig > SMALL_SIG) {
+      S  = (double*) mem_alloc(sizeof(double) * max_sig * 2);
+      D  = S + max_sig;
+      _C = (float*) mem_alloc(sizeof(float) * max_sig * max_sig);
+      _X = (node2_t*) mem_alloc(sizeof(node2_t) * max_sig * 2);
+      Loop = (node2_t**) mem_alloc(sizeof(node2_t*) * max_sig * 2);
+      _IsX = (char*) mem_alloc(max_sig * max_sig);
+      _RowsX = (node2_t**) mem_alloc(sizeof(node2_t*) * max_sig * 2);
+      _ColsX = _RowsX + max_sig;
+      IsUsed = (char*) mem_alloc(max_sig * 2);
+      Delta = (double*) mem_alloc(sizeof(double) * max_sig * max_sig);
+      Ur = (node1_t*) mem_alloc(sizeof(node1_t) * max_sig * 2);
+      Vr = Ur + max_sig;
+  } else {
+      S  = local_S;
+      D  = local_D;
+      _C = local_C;
+      _X = local_X;
+      Loop = local_Loop;
+      _IsX = local_IsX;
+      _RowsX = local_RowsX;
+      _ColsX = local_ColsX;
+      IsUsed = local_IsUsed;
+      Delta = local_Delta;
+      Ur = local_Ur;
+      Vr = local_Vr;
+  }
   
   /* COMPUTE THE DISTANCE MATRIX */
-  _maxC = 0;
-  for(i=0, P1=Signature1->Features; i < _n1; i++, P1++)
-    for(j=0, P2=Signature2->Features; j < _n2; j++, P2++) 
-      {
-	_C[i][j] = Dist(P1, P2);
-	if (_C[i][j] > _maxC)
-	  _maxC = _C[i][j];
-      }
+  _maxC = dfn(Signature1, Signature2);
 	
   /* SUM UP THE SUPPLY AND DEMAND */
   sSum = 0.0;
@@ -258,7 +422,7 @@ static float init(signature_t *Signature1, signature_t *Signature2, int extrapol
       if (diff < 0.0)
 	{
 	  for (j=0; j < _n2; j++)
-	    _C[_n1][j] = 0;
+	      MAT(_C, _n1, j) = 0;
 	  S[_n1] = -diff;
 	  _RowsX[_n1] = NULL;
 	  _n1++;
@@ -266,7 +430,7 @@ static float init(signature_t *Signature1, signature_t *Signature2, int extrapol
       else
 	{
 	  for (i=0; i < _n1; i++)
-	    _C[i][_n2] = 0;
+	      MAT(_C, i, _n2) = 0;
 	  D[_n2] = diff;
 	  _ColsX[_n2] = NULL;
 	  _n2++;
@@ -274,9 +438,8 @@ static float init(signature_t *Signature1, signature_t *Signature2, int extrapol
     }
 
   /* INITIALIZE THE BASIC VARIABLE STRUCTURES */
-  for (i=0; i < _n1; i++)
-    for (j=0; j < _n2; j++)
-	_IsX[i][j] = 0;
+  memset(_IsX, 0, max_sig * max_sig);
+
   _EndX = _X;
    
   _maxW = sSum > dSum ? sSum : dSum;
@@ -285,6 +448,8 @@ static float init(signature_t *Signature1, signature_t *Signature2, int extrapol
   russel(S, D);
 
   _EnterX = _EndX++;  /* AN EMPTY SLOT (ONLY _n1+_n2-1 BASIC VARIABLES) */
+
+  if (S != local_S) mem_free(S);
 
   if (extrapolate == 1 && sSum > dSum) return dSum * dSum / sSum;
   if (extrapolate == 2 && dSum > sSum) return sSum * sSum / dSum;
@@ -369,10 +534,10 @@ static void findBasicVariables(node1_t *U, node1_t *V)
 	      for (CurU=u0Head.Next; CurU != NULL; CurU=CurU->Next)
 		{
 		  i = CurU->i;
-		  if (_IsX[i][j])
+		  if (MAT(_IsX, i, j))
 		    {
 		      /* COMPUTE U[i] */
-		      CurU->val = _C[i][j] - CurV->val;
+			CurU->val = MAT(_C, i, j) - CurV->val;
 		      /* ...AND ADD IT TO THE MARKED LIST */
 		      PrevU->Next = CurU->Next;
 		      CurU->Next = u1Head.Next != NULL ? u1Head.Next : NULL;
@@ -399,10 +564,10 @@ static void findBasicVariables(node1_t *U, node1_t *V)
 	      for (CurV=v0Head.Next; CurV != NULL; CurV=CurV->Next)
 		{
 		  j = CurV->i;
-		  if (_IsX[i][j])
+		  if (MAT(_IsX, i, j))
 		    {
 		      /* COMPUTE V[j] */
-		      CurV->val = _C[i][j] - CurU->val;
+			CurV->val = MAT(_C, i, j) - CurU->val;
 		      /* ...AND ADD IT TO THE MARKED LIST */
 		      PrevV->Next = CurV->Next;
 		      CurV->Next = v1Head.Next != NULL ? v1Head.Next: NULL;
@@ -437,9 +602,9 @@ static int isOptimal(node1_t *U, node1_t *V)
   deltaMin = EMD_INFINITY;
   for(i=0; i < _n1; i++)
     for(j=0; j < _n2; j++)
-      if (! _IsX[i][j])
+	if (! MAT(_IsX, i, j))
 	{
-	  delta = _C[i][j] - U[i].val - V[j].val;
+	    delta = MAT(_C, i, j) - U[i].val - V[j].val;
 	  if (deltaMin > delta)
 	    {
               deltaMin = delta;
@@ -466,7 +631,6 @@ static int isOptimal(node1_t *U, node1_t *V)
  */
 }
 
-
 /**********************
     newSol
 **********************/
@@ -475,8 +639,8 @@ static void newSol()
     int i, j, k;
     double xMin;
     int steps;
-    node2_t *Loop[2*MAX_SIG_SIZE1], *CurX, *LeaveX;
- 
+    node2_t *CurX, *LeaveX;
+
 #if DEBUG_LEVEL > 3
     Rprintf("EnterX = (%d,%d)\n", _EnterX->i, _EnterX->j);
 #endif
@@ -484,7 +648,7 @@ static void newSol()
     /* ENTER THE NEW BASIC VARIABLE */
     i = _EnterX->i;
     j = _EnterX->j;
-    _IsX[i][j] = 1;
+    MAT(_IsX, i, j) = 1;
     _EnterX->NextC = _RowsX[i];
     _EnterX->NextR = _ColsX[j];
     _EnterX->val = 0;
@@ -519,7 +683,7 @@ static void newSol()
     /* REMOVE THE LEAVING BASIC VARIABLE */
     i = LeaveX->i;
     j = LeaveX->j;
-    _IsX[i][j] = 0;
+    MAT(_IsX, i, j) = 0;
     if (_RowsX[i] == LeaveX)
       _RowsX[i] = LeaveX->NextC;
     else
@@ -550,12 +714,10 @@ static void newSol()
 **********************/
 static int findLoop(node2_t **Loop)
 {
-  int i, steps;
+  int steps;
   node2_t **CurX, *NewX;
-  char IsUsed[2*MAX_SIG_SIZE1]; 
  
-  for (i=0; i < _n1+_n2; i++)
-    IsUsed[i] = 0;
+  memset(IsUsed, 0, _n1 + _n2);
 
   CurX = Loop;
   NewX = *CurX = _EnterX;
@@ -626,15 +788,16 @@ static int findLoop(node2_t **Loop)
   if (CurX == Loop)
     Rf_error("emd: Unexpected error in findLoop!");
 #if DEBUG_LEVEL > 3
-  Rprintf("FOUND LOOP:\n");
-  for (i=0; i < steps; i++)
-    Rprintf("%d: (%d,%d)\n", i, Loop[i]->i, Loop[i]->j);
+  {
+      int i;
+      Rprintf("FOUND LOOP:\n");
+      for (i=0; i < steps; i++)
+	  Rprintf("%d: (%d,%d)\n", i, Loop[i]->i, Loop[i]->j);
+  }
 #endif
 
   return steps;
 }
-
-
 
 /**********************
     russel
@@ -643,11 +806,11 @@ static void russel(double *S, double *D)
 {
   int i, j, found, minI, minJ;
   double deltaMin, oldVal, diff;
-  double Delta[MAX_SIG_SIZE1][MAX_SIG_SIZE1];
-  node1_t Ur[MAX_SIG_SIZE1], Vr[MAX_SIG_SIZE1];
   node1_t uHead, *CurU, *PrevU;
   node1_t vHead, *CurV, *PrevV;
   node1_t *PrevUMinI = PrevUMinI, *PrevVMinJ, *Remember;
+
+  
 
   /* INITIALIZE THE ROWS LIST (Ur), AND THE COLUMNS LIST (Vr) */
   uHead.Next = CurU = Ur;
@@ -675,7 +838,7 @@ static void russel(double *S, double *D)
     for(j=0; j < _n2 ; j++)
       {
 	float v;
-	v = _C[i][j];
+	v = MAT(_C, i, j);
 	if (Ur[i].val <= v)
 	  Ur[i].val = v;
 	if (Vr[j].val <= v)
@@ -685,7 +848,7 @@ static void russel(double *S, double *D)
   /* COMPUTE THE Delta MATRIX */
   for(i=0; i < _n1 ; i++)
     for(j=0; j < _n2 ; j++)
-      Delta[i][j] = _C[i][j] - Ur[i].val - Vr[j].val;
+	MAT(Delta, i, j) = MAT(_C, i, j) - Ur[i].val - Vr[j].val;
 
   /* FIND THE BASIC VARIABLES */
   do
@@ -715,9 +878,9 @@ static void russel(double *S, double *D)
 	    {
 	      int j;
 	      j = CurV->i;
-	      if (deltaMin > Delta[i][j])
+	      if (deltaMin > MAT(Delta, i, j))
 		{
-		  deltaMin = Delta[i][j];
+		    deltaMin = MAT(Delta, i, j);
 		  minI = i;
 		  minJ = j;
 		  PrevUMinI = PrevU;
@@ -743,7 +906,7 @@ static void russel(double *S, double *D)
 	    {
 	      int j;
 	      j = CurV->i;
-	      if (CurV->val == _C[minI][j])  /* COLUMN j NEEDS UPDATING */
+	      if (CurV->val == MAT(_C, minI, j))  /* COLUMN j NEEDS UPDATING */
 		{
 		  /* FIND THE NEW MAXIMUM VALUE IN THE COLUMN */
 		  oldVal = CurV->val;
@@ -752,15 +915,15 @@ static void russel(double *S, double *D)
 		    {
 		      int i;
 		      i = CurU->i;
-		      if (CurV->val <= _C[i][j])
-			CurV->val = _C[i][j];
+		      if (CurV->val <= MAT(_C, i, j))
+			  CurV->val = MAT(_C, i, j);
 		    }
 		  
 		  /* IF NEEDED, ADJUST THE RELEVANT Delta[*][j] */
 		  diff = oldVal - CurV->val;
 		  if (fabs(diff) < EPSILON * _maxC)
 		    for (CurU=uHead.Next; CurU != NULL; CurU=CurU->Next)
-		      Delta[CurU->i][j] += diff;
+			MAT(Delta, CurU->i, j) += diff;
 		}
 	    }
 	}
@@ -770,7 +933,7 @@ static void russel(double *S, double *D)
 	    {
 	      int i;
 	      i = CurU->i;
-	      if (CurU->val == _C[i][minJ])  /* ROW i NEEDS UPDATING */
+	      if (CurU->val == MAT(_C, i, minJ))  /* ROW i NEEDS UPDATING */
 		{
 		  /* FIND THE NEW MAXIMUM VALUE IN THE ROW */
 		  oldVal = CurU->val;
@@ -779,15 +942,15 @@ static void russel(double *S, double *D)
 		    {
 		      int j;
 		      j = CurV->i;
-		      if(CurU->val <= _C[i][j])
-			CurU->val = _C[i][j];
+		      if(CurU->val <= MAT(_C, i, j))
+			  CurU->val = MAT(_C, i, j);
 		    }
 		  
 		  /* If NEEDED, ADJUST THE RELEVANT Delta[i][*] */
 		  diff = oldVal - CurU->val;
 		  if (fabs(diff) < EPSILON * _maxC)
 		    for (CurV=vHead.Next; CurV != NULL; CurV=CurV->Next)
-		      Delta[i][CurV->i] += diff;
+			MAT(Delta, i, CurV->i) += diff;
 		}
 	    }
 	}
@@ -826,7 +989,7 @@ static void addBasicVariable(int minI, int minJ, double *S, double *D,
     }
 
   /* X(minI,minJ) IS A BASIC VARIABLE */
-  _IsX[minI][minJ] = 1; 
+  MAT(_IsX, minI, minJ) = 1; 
 
   _EndX->val = T;
   _EndX->i = minI;
@@ -861,12 +1024,12 @@ static void printSolution()
   Rprintf("SIG1\tSIG2\tFLOW\tCOST\n");
 #endif
   for(P=_X; P < _EndX; P++)
-    if (P != _EnterX && _IsX[P->i][P->j])
+      if (P != _EnterX && MAT(_IsX, P->i, P->j))
       {
 #if DEBUG_LEVEL > 2
-	Rprintf("%d\t%d\t%f\t%f\n", P->i, P->j, P->val, _C[P->i][P->j]);
+	  Rprintf("%d\t%d\t%f\t%f\n", P->i, P->j, P->val, MAT(_C, P->i, P->j));
 #endif
-	totalCost += (double)P->val * _C[P->i][P->j];
+	  totalCost += (double)P->val * MAT(_C, P->i, P->j);
       }
 
   Rprintf("COST = %f\n", totalCost);
